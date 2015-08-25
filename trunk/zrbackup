@@ -1,0 +1,152 @@
+#!/bin/bash
+# WARNING: This script creates ZFS filesystems, snapshots, and runs rsync with the "--delete" option.
+# REVIEW IT AND TEST IT THOROUGHLY BEFORE USING IT ON ANY PRODUCTION SYSTEMS.
+# More information may be found at http://code.google.com/p/zrbackup/
+set -o errexit
+FILESYSTEM=backup1a
+BACKUPHOSTS=backup-hosts
+LOCKDIR=/var/run
+LOCKFILE=zrbackup.pid
+EXCLUDEBASE=backup-exclude-
+
+# Count (+ 1) of the number of snapshots of each type to keep.
+# $1 filesystem
+# $2 backuphost
+function hostdefaults {
+  KEEPYEARLY=3
+  KEEPMONTHLY=7
+  KEEPDAILY=31
+  KEEPLATEST=4
+
+  if [ -f "/$1/$2-settings" ]; then
+    echo "  Overriding defaults for host."
+    source /$1/$2-settings
+  fi
+}
+
+# $1 indent
+# $2 filesystem
+# $3 script to execute, if exists
+function runifexists {
+  if [ -x "/$2/$3" ]; then
+    echo "$1Executing: $3"
+    /$2/$3
+  fi
+}
+
+# $1 filesystem
+# $2 backuphost
+function trimsnapshots {
+  zfs get -rHp used $1/$2 | cut -f 1 | sort -r | grep ^$1/$2@[0-9][0-9][0-9][0-9]$ | tail -n +$KEEPYEARLY | xargs -r -l zfs destroy
+  zfs get -rHp used $1/$2 | cut -f 1 | sort -r | grep ^$1/$2@[0-9][0-9][0-9][0-9][0-9][0-9]$ | tail -n +$KEEPMONTHLY | xargs -r -l zfs destroy
+  zfs get -rHp used $1/$2 | cut -f 1 | sort -r | grep ^$1/$2@[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]$ | tail -n +$KEEPDAILY | xargs -r -l zfs destroy
+  zfs get -rHp used $1/$2 | cut -f 1 | sort -r | grep ^$1/$2@[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]-[0-9][0-9][0-9][0-9][0-9][0-9]$ | tail -r -n +$KEEPLATEST | xargs -l zfs destroy
+}
+
+# $1 snapshot name
+function snapshotexists {
+  local result=0
+  
+  for SNAPSHOTNAME in $SNAPSHOTS
+  do
+    if [ $SNAPSHOTNAME = $1 ]; then
+      result=1
+      break
+    fi
+  done
+  
+  echo $result
+}
+
+# $1 filesystem
+# $2 backuphost
+# $3 name for ZFS snapshot
+# $4 readable snapshot name
+function createsnapshot {
+  if [ $(snapshotexists "$1/$2@$3") -eq 0 ]; then
+    echo -n "  Creating '$4' snapshot..."
+    rm -f /$1/$2/$4
+    zfs snapshot $1/$2@$3
+    ln -s /$1/$2/.zfs/snapshot/$3/mountpoints /$1/$2/$4
+    echo " done."
+  fi
+}
+
+function runbackups {
+  runifexists "" $FILESYSTEM zrbackup-preflight
+  for BACKUPHOST in $(cat /$FILESYSTEM/$BACKUPHOSTS)
+  do
+    echo "Backing up host:" $BACKUPHOST
+    hostdefaults $FILESYSTEM $BACKUPHOST
+    runifexists "  " $FILESYSTEM $BACKUPHOST-preflight
+
+    if [ ! -d "/$FILESYSTEM/$BACKUPHOST" ]; then
+      echo "  Creating filesystem for host."
+      zfs create $FILESYSTEM/$BACKUPHOST
+    fi
+  
+    MOUNTPOINTS=`ssh $BACKUPHOST cat /etc/mtab | grep " ext3 " | cut -f 2 -d ' '`
+    for MOUNTPOINT in $MOUNTPOINTS
+    do
+      echo "  Mountpoint:" $MOUNTPOINT
+      if [ $MOUNTPOINT = "/" ]; then
+        DESTDIR="root"
+      else
+        DESTDIR=`basename $MOUNTPOINT`
+      fi
+  
+      if [ ! -d "/$FILESYSTEM/$BACKUPHOST/mountpoints/$DESTDIR" ]; then
+        echo "    Creating directory for mountpoint."
+        mkdir -p /$FILESYSTEM/$BACKUPHOST/mountpoints/$DESTDIR
+      fi
+  
+      if [ -d "/$FILESYSTEM/$BACKUPHOST/mountpoints/$DESTDIR" ]; then
+        EXCLUDEFROM=/$FILESYSTEM/$EXCLUDEBASE$BACKUPHOST
+        set +o errexit
+        if [ -f "$EXCLUDEFROM" ]; then
+          rsync -avx -e "ssh -c blowfish" --numeric-ids --delete --exclude-from $EXCLUDEFROM $BACKUPHOST:$MOUNTPOINT /$FILESYSTEM/$BACKUPHOST/mountpoints/$DESTDIR > /$FILESYSTEM/$BACKUPHOST/mountpoints/$DESTDIR-rsync
+        else
+          rsync -avx -e "ssh -c blowfish" --numeric-ids --delete $BACKUPHOST:$MOUNTPOINT /$FILESYSTEM/$BACKUPHOST/mountpoints/$DESTDIR > /$FILESYSTEM/$BACKUPHOST/mountpoints/$DESTDIR-rsync
+        fi
+        RETVAL=$?
+        [ $RETVAL -ne 0 -a $RETVAL -ne 24 ] && exit $RETVAL
+        set -o errexit
+      fi
+    done
+  
+    date > /$FILESYSTEM/$BACKUPHOST/mountpoints/last-backup
+  
+    echo -n "  Creating 'Latest' snapshot..."
+    LATEST=`date +"%Y%m%d-%H%M%S"`
+    rm -f /$FILESYSTEM/$BACKUPHOST/Latest
+    zfs snapshot $FILESYSTEM/$BACKUPHOST@$LATEST
+    ln -s /$FILESYSTEM/$BACKUPHOST/.zfs/snapshot/$LATEST/mountpoints /$FILESYSTEM/$BACKUPHOST/Latest 
+    echo " done."
+  
+    SNAPSHOTS=$(zfs list -H -o name -t snapshot | grep "^$FILESYSTEM/$BACKUPHOST")
+    createsnapshot $FILESYSTEM $BACKUPHOST `date +"%Y"` FirstOfTheYear
+    createsnapshot $FILESYSTEM $BACKUPHOST `date +"%Y%m"` FirstOfTheMonth
+    createsnapshot $FILESYSTEM $BACKUPHOST `date +"%Y%m%d"` FirstOfTheDay
+    
+    trimsnapshots $FILESYSTEM $BACKUPHOST
+    
+    runifexists "  " $FILESYSTEM $BACKUPHOST-postflight
+  done
+  runifexists "" $FILESYSTEM zrbackup-postflight
+}
+
+if [ ! -d $LOCKDIR ]; then
+  echo "`basename $0`: $LOCKDIR missing."
+  exit 1
+fi
+
+# Uses a technique from http://www.davidpashley.com/articles/writing-robust-shell-scripts.html
+if ( set -o noclobber; echo "$$" > "$LOCKDIR/$LOCKFILE") 2> /dev/null; 
+then
+   trap 'rm -f "$LOCKDIR/$LOCKFILE"; exit $?' INT TERM EXIT
+   runbackups
+   rm -f "$LOCKDIR/$LOCKFILE"
+   trap - INT TERM EXIT
+else
+   echo "`basename $0`: already running under pid $(cat $LOCKDIR/$LOCKFILE)."
+fi 
